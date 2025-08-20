@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# Build/outputs
+output/
+dist/
+build/
+*.h5
+
+# Fortran build artifacts
+fortran/obj/
+fortran/lib/libpygreat.*
+*.mod
+*.o
+*.a
+*.so
+*.dylib
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -1,0 +1,120 @@
+# ----------------- I/O parameters ---------------------------
+input_directory=/Users/atorres/Codes/SN_mode_analysis/Simulation_data/Martin_models/CC2dGW/s20.0--LS220--GravA  # Data input directory
+
+output_directory=./output/#CC2dGW/s20.0--LS220--GravA/test_interp_shock/
+
+input_mode=3                #Origin of the data
+                                #> 1. Data from Alex Summa
+                                #> 2. Coconut
+                                #> 3. Data from Martin Obergaulinger (AENUS code)
+				#> 4. Data from Haakon Andresen
+
+nt_ini=1                     #Index of the first time-file to process
+nt_last=1000000              #Index of the last time-file to process
+nt_step=1                    #Read files every nt_step steps
+
+interpolate_grid=.false.      #Interpolate grid
+int_factor=4                 #Interpolation factor
+                              #Only 2 or 4 allowed
+
+
+
+
+# --------------- General parameters ---------------------------
+
+l=2                          # Value of l (degree of the spherical harmonic decomposition)
+
+newtonian=.true.             # Enable newtonian calculation of ggrav (.true.). 
+                             # Otherwise (.false.) general relativistic calculation.
+
+cowling=.false.               # Compute with cowling approximation (.true.) or in dynamical 
+                             #   space-time (.false.)
+
+cal_dphi=.true.             # Compute perturbations of the conformal factor (delta psi)
+
+mode=1                       # Mode approximation
+		   	     #    1: All modes
+    			     #    2: Compute p-mode approximation
+    			     #    3: Compute g-mode approximation 
+
+ggrav_mode=2                 # Select the ggrav (G) computation formula
+                             #      1: ggrav = -dalpha_dr
+                             #      2: ggrav = dp_dr/(rho h)
+                             #      3: Mean value of 1 and 2 
+
+use_precomputed_n2=.false.   # .true.: Do not compute N^2 and use pre-computed
+                             #         values of N^2. Do not set to .true.
+                             #         unless you know what you are doing.
+
+verb=.false.                  # Verbose mode (for debugging)
+
+
+# ------------ Boundary conditions ---------------------
+
+outer_bc_type=1              # Boundary condition imposed at the outer radius
+			     #    1: Shock boundary condition (eta_r=0). This is consistent 
+                             #       with the conditions at the shock, if the background 
+                             #       accretion shock is neglected (Torres-Forne et al 2018,2019).
+        		     #    2: Vacuum boundary conditions (Delta P=0). This is the
+			     #       standard boundary conditions used for neutron stars 
+			     #       surrounded by vacuum. If used for proto-neutron stars
+			     #       it will compute wrongly most of the p-modes.
+
+inner_bc_type=1             # Boundary condition imposed at the inner radius
+			     #    1: center of the star (symmetry conditions)
+ 			     #    2: zero perturbation (assumes that inner boundary is not at r=0)
+
+
+outer_boundary_mode=1      # Outer radius selection
+                            #    1: Shock 
+        		    #    2: Density threshold condition
+			    #	 3: 
+			    #    4: Brunt-Vaisala regions
+                            #    5: Shock region 
+
+inner_boundary_mode=1      # Inner radius selection
+                            #	1:Center of the star
+                            #	2:N2>10^6 condition 
+				
+n2_region=1
+
+n2_thr=6.0d6                # Threshold in n2 to determine regions.
+
+rho_thr=1.0d11             # Threshold in density to apply b.c.
+
+
+# --- Parameters for the coarse eigenmode search  ---
+
+fmin=40.0d0                    # Minimum value of frequency for the eigenvalue search
+
+fmax=4000.0d0                   # Maximum value of frequency for the eigenvalue search
+
+funits=1                      # Units for the frequency
+			      #     0: frequency code units (G=C=1 + cm), i.e. cm^-1
+			      #     1: frequency Hz
+			      #     2: angular frequency in code units (cm^-1)
+
+nwmax = 4000                   #Number of frequencies for the coarse eigenfrequency search 
+
+logf_mode = .true.           #      .true.: Coarse search equally spaced in logarithm of f
+                              #      .false.: equally spaced in f
+
+w2_sign = +1                  # Sign of omega^2
+	  		      #     +1 : search for positive values of omega^2 (real eigenvalues)
+     	                      #     -1 : search for negative values of omega^2 (purely imaginary eigenvalues)
+
+# --- Parameters for the fine eigenmode search ------
+
+tol = 1.0d-6                  # Tolerance for eigenvalue calculation
+
+# --- Parameters for the eigenmode integration ------
+
+maxiter = 50                  # Maximum number of iterations in the shooting method to match 
+                              # the outer boundary conditions
+
+integration_mode=1            # Select how to integrate equations (only one option avaliable)
+                              #           1: Explicit integration for all equations (6x6)
+
+ip_coeffs=4                  # Regularize first ip_coeff points
+
+	
