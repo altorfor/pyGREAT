@@ -13,7 +13,7 @@ nt_ini=1                     #Index of the first time-file to process
 nt_last=1000000              #Index of the last time-file to process
 nt_step=1                    #Read files every nt_step steps
 
-interpolate_grid=.false.      #Interpolate grid
+interpolate_grid=.true.      #Interpolate grid
 int_factor=4                 #Interpolation factor
                               #Only 2 or 4 allowed
 
@@ -118,3 +118,15 @@ integration_mode=1            # Select how to integrate equations (only one opti
 ip_coeffs=4                  # Regularize first ip_coeff points
 
 	
+
+
+# ------ Interpolation (uniform everywhere) ------
+interpolation   = .true.
+interp_mode     = interior
+interp_kind     = pchip        # or linear
+interp_buffer   = 15           # cells after iR included in the refined region
+interp_n_inner  = 1000         # <-- this is the one you’re missing
+interp_verbose = .false.
+
+
+#-------------------------------

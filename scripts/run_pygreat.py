@@ -9,7 +9,7 @@ import sys
 # Make 'pygreat' importable when running directly from repo
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from pygreat.pygreat import run_from_parfile
+from pygreat.pipeline import run_from_parfile
 
 
 def main():
