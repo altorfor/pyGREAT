@@ -1,4 +1,4 @@
-# src/pygreat/io/obergaulinger.py
+# pygreat/io/obergaulinger.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,72 +12,12 @@ __all__ = [
     "select_background",
 ]
 
-# -------------------------
-# Data container (raw file)
-# -------------------------
-@dataclass
-class ObergaulingerData:
-    num_t: int
-    m: int
-    time: np.ndarray
-    r: np.ndarray
-    rho: np.ndarray
-    y_e: np.ndarray
-    p: np.ndarray
-    e: np.ndarray
-    t: np.ndarray
-    cs: np.ndarray
-    gamma1: np.ndarray
-    v1: np.ndarray
-    g: np.ndarray
-    nv: np.ndarray
+# ---------------------------------------------------------------------------
+# Internal helpers for fixed-format Fortran unformatted (4-byte BE markers)
+# ---------------------------------------------------------------------------
 
-    def to_bg(self, n: int) -> dict:
-        """Map time slice n → GREAT background dict (cgs, Newtonian metric)."""
-        if n < 0 or n >= self.num_t:
-            raise IndexError(f"time index {n} out of range [0,{self.num_t-1}]")
-
-        r = np.array(self.r, dtype=np.float64, order="F", copy=True)
-
-        rho_raw = np.asarray(self.rho[n, :], dtype=np.float64, order="F")
-        p_raw   = np.asarray(self.p[n,   :], dtype=np.float64, order="F")
-        e_raw   = np.asarray(self.e[n,   :], dtype=np.float64, order="F")
-        cs_raw  = np.asarray(self.cs[n,  :], dtype=np.float64, order="F")
-        g_raw   = np.asarray(self.g[n,   :], dtype=np.float64, order="F")
-        v1_raw  = np.asarray(self.v1[n,  :], dtype=np.float64, order="F")
-        y_e     = np.asarray(self.y_e[n, :], dtype=np.float64, order="F")
-        T       = np.asarray(self.t[n,   :], dtype=np.float64, order="F")
-        gamma1  = np.asarray(self.gamma1[n,:], dtype=np.float64, order="F")
-
-        # Unit conversions (Obergaulinger → GREAT expectations)
-        rho = rho_raw * RHO_GEOM
-        p   = p_raw   * P_GEOM
-        eps = e_raw / (rho_raw * C_LIGHT**2) + (939.57 - 8.8) / 931.49 - 1.0
-        cs2 = (cs_raw / C_LIGHT) ** 2
-
-        return {
-            "time": float(self.time[n]),
-            "nt": int(n),
-            "r": r,
-            "rho": rho,
-            "eps": eps,
-            "p": p,
-            "c_sound_squared": cs2,
-            "phi": np.ones_like(r),
-            "alpha": 1.0 + g_raw / (C_LIGHT ** 2),
-            "U": g_raw,
-            "gamma_one": gamma1,
-            "v_1": v1_raw / C_LIGHT,
-            "y_e": y_e,
-            "t": T,
-            "entropy": np.zeros_like(r),
-            "calculate_n2": True,
-        }
-# -------------------------
-# Fixed-format I/O helpers
-# -------------------------
 def _read_record4(f) -> bytes:
-    """Read one Fortran unformatted sequential record with 4-byte big-endian markers."""
+    """Read one Fortran sequential record with 4-byte big-endian markers."""
     h = f.read(4)
     if not h:
         raise EOFError("unexpected EOF in record header")
@@ -102,6 +42,7 @@ def _mat_f8_be_F(buf: bytes, rows: int, cols: int) -> np.ndarray:
     a = np.frombuffer(buf, dtype=">f8")
     if a.size != rows * cols:
         raise ValueError(f"matrix has {a.size} elements; expected {rows*cols}")
+    # Fortran order to match the producing code
     return np.asfortranarray(a.reshape((rows, cols), order="F"))
 
 def _maybe_drop_bad_t0(time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv):
@@ -119,8 +60,8 @@ def _maybe_drop_bad_t0(time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv):
     drop = bad_nan or bad_zero
     if not drop:
         return False, (time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv)
-    # Drop t=0 and re-fortranize 2D matrices
-    time = time[1:]
+
+    time   = time[1:]
     rho    = np.asfortranarray(rho[1:, :])
     y_e    = np.asfortranarray(y_e[1:, :])
     p      = np.asfortranarray(p[1:, :])
@@ -133,13 +74,90 @@ def _maybe_drop_bad_t0(time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv):
     nv     = nv[1:]
     return True, (time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv)
 
-# -------------------------
+# Mass terms used in eps conversion (kept explicit for traceability)
+_EPS_MASS_CORR = (939.57 - 8.8) / 931.49  # dimensionless
+_TINY = 1e-300
+
+# ---------------------------------------------------------------------------
+# Data container (raw file) + mapping to GREAT background
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ObergaulingerData:
+    num_t: int
+    m: int
+    time: np.ndarray       # shape (num_t,)
+    r: np.ndarray          # shape (m,)
+    rho: np.ndarray        # shape (num_t, m)
+    y_e: np.ndarray
+    p: np.ndarray
+    e: np.ndarray
+    t: np.ndarray
+    cs: np.ndarray
+    gamma1: np.ndarray
+    v1: np.ndarray
+    g: np.ndarray
+    nv: np.ndarray         # shape (num_t,)
+
+    def to_bg(self, n: int) -> dict:
+        """
+        Map time slice n → GREAT background dict (cgs, Newtonian metric).
+        Keys intentionally match the rest of the pipeline:
+          r, rho, eps, p, c_sound_squared, phi, alpha, U, gamma_one, v_1, y_e, t, entropy
+        """
+        if n < 0 or n >= self.num_t:
+            raise IndexError(f"time index {n} out of range [0,{self.num_t-1}]")
+
+        # 1D radius (shared for all times). Keep as float64 view (no unnecessary copy).
+        r = np.asarray(self.r, dtype=np.float64)
+
+        # Per-time 1D slices (views on Fortran-ordered 2D arrays)
+        rho_raw = np.asarray(self.rho[n, :], dtype=np.float64)
+        p_raw   = np.asarray(self.p[n,   :], dtype=np.float64)
+        e_raw   = np.asarray(self.e[n,   :], dtype=np.float64)
+        cs_raw  = np.asarray(self.cs[n,  :], dtype=np.float64)
+        g_raw   = np.asarray(self.g[n,   :], dtype=np.float64)
+        v1_raw  = np.asarray(self.v1[n,  :], dtype=np.float64)
+        y_e     = np.asarray(self.y_e[n, :], dtype=np.float64)
+        T       = np.asarray(self.t[n,   :], dtype=np.float64)
+        gamma1  = np.asarray(self.gamma1[n,:], dtype=np.float64)
+
+        # Unit conversions (Obergaulinger → GREAT expectations)
+        rho = rho_raw * RHO_GEOM                     # -> cgs
+        p   = p_raw   * P_GEOM                       # -> cgs
+        eps = e_raw / (np.maximum(rho_raw, _TINY) * C_LIGHT**2) + _EPS_MASS_CORR - 1.0
+        cs2 = (cs_raw / C_LIGHT) ** 2                # dimensionless
+        alpha = 1.0 + g_raw / (C_LIGHT ** 2)         # simple Newtonian mapping
+        U = g_raw                                     # keep raw g for reference
+
+        # Background dictionary returned to the pipeline
+        return {
+            "time": float(self.time[n]),
+            "nt": int(n),
+            "r": r,
+            "rho": rho,
+            "eps": eps,
+            "p": p,
+            "c_sound_squared": cs2,
+            "phi": np.ones_like(r),          # flat conformal factor in this mapping
+            "alpha": alpha,
+            "U": U,
+            "gamma_one": gamma1,
+            "v_1": v1_raw / C_LIGHT,         # convert to c=1 units
+            "y_e": y_e,
+            "t": T,
+            "entropy": np.zeros_like(r),     # not provided by source
+            "calculate_n2": True,            # hint for GREAT (compute N^2)
+        }
+
+# ---------------------------------------------------------------------------
 # Reader (fixed layout)
-# -------------------------
+# ---------------------------------------------------------------------------
+
 def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
     """
-    Read CoCo2d-evol.dat with fixed format:
-      - 4-byte record markers (big-endian)
+    Read CoCo2d-evol.dat with fixed format produced by Obergaulinger’s code:
+      - Fortran unformatted records with 4-byte big-endian markers
       - header (num_t, m) as big-endian int32
       - payloads as big-endian float64
       - 2D fields stored in Fortran order
@@ -158,6 +176,9 @@ def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
      10: v1(num_t,m)
      11: g(num_t,m)
      12: nv(num_t)       f8
+
+    Radius is assumed to be km in the file and converted to cm
+    unless values are already clearly in cm.
     """
     path = Path(path)
     with path.open("rb") as f:
@@ -172,7 +193,8 @@ def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
         time = _vec_f8_be(_read_record4(f), num_t)
         r_raw = _vec_f8_be(_read_record4(f), m)
 
-        # Normalize radius to cm (if file gives km)
+        # Normalize radius to cm (assume km unless clearly already cm)
+        # Heuristic: typical cm radii for CCSN >> 1e4
         if float(r_raw[0]) > 1.0e4:
             r_cm = r_raw
         else:
@@ -188,10 +210,9 @@ def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
         gamma1 = _mat_f8_be_F(_read_record4(f), num_t, m)
         v1     = _mat_f8_be_F(_read_record4(f), num_t, m)
         g      = _mat_f8_be_F(_read_record4(f), num_t, m)
-
         nv     = _vec_f8_be(_read_record4(f), num_t)
 
-        # sanitize: drop bad t=0 (zeros/NaNs) if present
+        # Sanitize: drop bad t=0 (zeros/NaNs) if present
         dropped, (time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv) = _maybe_drop_bad_t0(
             time, rho, y_e, p, e, t, cs, gamma1, v1, g, nv
         )
@@ -200,6 +221,10 @@ def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
             if num_t <= 0:
                 raise ValueError("after dropping invalid t=0, file has no time slices")
 
+    # Minimal geometry checks
+    if r_cm.ndim != 1 or r_cm.size != m or not np.all(np.diff(r_cm) > 0):
+        raise ValueError("radius vector must be strictly increasing of length m")
+
     return ObergaulingerData(
         num_t=num_t, m=m,
         time=time, r=r_cm,
@@ -207,11 +232,10 @@ def read_coco2d_evol(path: str | Path) -> ObergaulingerData:
         gamma1=gamma1, v1=v1, g=g, nv=nv,
     )
 
-# -------------------------
-# Per-snapshot mapping to GREAT inputs
-# -------------------------
-# add near the bottom of pygreat/io/obergaulinger.py
+# ---------------------------------------------------------------------------
+# Back-compat shim (pipeline occasionally imports this)
+# ---------------------------------------------------------------------------
 
-def select_background(data, n, **_ignored):
+def select_background(data: ObergaulingerData, n: int, **_ignored) -> dict:
     """Back-compat shim—use data.to_bg(n) going forward."""
     return data.to_bg(n)

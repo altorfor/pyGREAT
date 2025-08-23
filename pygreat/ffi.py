@@ -1,20 +1,27 @@
-# python/pygreat/ffi.py
+# pygreat/ffi.py
 from __future__ import annotations
-import sys
 from ctypes import CDLL
 from pathlib import Path
 import platform
 
-def load_lib() -> CDLL:
+
+def _default_lib_path() -> Path:
+    """
+    Resolve the packaged GREAT shim:
+      <repo>/fortran/lib/libpygreat.{dylib|so}
+    """
     here = Path(__file__).resolve().parent
     libdir = (here.parent / "fortran" / "lib").resolve()
-    if platform.system() == "Darwin":
-        name = "libpygreat.dylib"
-    elif platform.system() == "Linux":
-        name = "libpygreat.so"
-    else:
-        raise OSError("Unsupported OS for libpygreat")
-    libpath = libdir / name
+    name = "libpygreat.dylib" if platform.system() == "Darwin" else "libpygreat.so"
+    return (libdir / name)
+
+
+def load_lib() -> CDLL:
+    """
+    Load the GREAT shared library from the canonical repo location.
+    (No environment-variable magic; explicit path for reproducibility.)
+    """
+    libpath = _default_lib_path()
     if not libpath.exists():
-        raise FileNotFoundError(f"libpygreat not found at {libpath}")
+        raise FileNotFoundError(f"pyGREAT shared library not found at: {libpath}")
     return CDLL(str(libpath))

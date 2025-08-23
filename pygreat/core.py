@@ -1,46 +1,51 @@
 # pygreat/core.py
 from __future__ import annotations
 
-import os
 from ctypes import (
     CDLL, POINTER, byref, c_char_p, c_double, c_int
 )
 from pathlib import Path
 import numpy as np
 
-
-def _default_lib_path() -> Path:
-    # lib lives at ../../fortran/lib/libpygreat.{dylib|so} relative to this file
-    root = Path(__file__).resolve().parents[1]
-    libname = {
-        "darwin": "libpygreat.dylib",
-        "linux": "libpygreat.so",
-    }
-    import sys
-    fn = libname["darwin" if sys.platform == "darwin" else "linux"]
-    return (root / "fortran" / "lib" / fn).resolve()
+from .ffi import load_lib
 
 
-def _load_lib() -> CDLL:
-    # Prefer explicit path in codebase; avoid env vars per your preference.
-    libpath = _default_lib_path()
-    if not libpath.exists():
-        raise FileNotFoundError(f"pyGREAT shared library not found: {libpath}")
-    return CDLL(str(libpath))
+# ----------------------------------------------------------------------------- #
+#                           Library + error handling                            #
+# ----------------------------------------------------------------------------- #
+
+_lib: CDLL = load_lib()
+
+# Friendly messages for common ierr values (edit as needed to match Fortran codes)
+_ERR_MAP = {
+    # Loader / parameter stage
+    101: "Invalid or unreadable parameter file.",
+    # Background ingestion
+    301: "Background arrays have inconsistent sizes or invalid values.",
+    # Analysis stage
+    401: "Eigenvalue search failed to converge.",
+    901: "Analysis preconditions not satisfied (e.g., shock/outer boundary not found or "
+         "background state invalid for this mode).",
+}
+
+def _err_msg(where: str, ierr: int) -> str:
+    msg = _ERR_MAP.get(int(ierr), "Unspecified error (see GREAT logs).")
+    return f"{where} failed with ierr={int(ierr)}: {msg}"
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+#                               Fortran bindings                                #
+# ----------------------------------------------------------------------------- #
 
-_lib = _load_lib()
-
-# Fortran shim symbols (bind(C) names)
+# Capture buffer
 _lib.pg_capture_reset.argtypes = []
 _lib.pg_capture_reset.restype  = None
 
+# Parameters
 _lib.pg_load_parameters.argtypes = [c_char_p, POINTER(c_int)]
 _lib.pg_load_parameters.restype  = None
 
-# pg_set_background(nt, time, m, r, rho, eps, p, cs2, phi, alpha, v1, ierr)
+# Background set: pg_set_background(nt, time, m, r, rho, eps, p, cs2, phi, alpha, v1, ierr)
 _lib.pg_set_background.argtypes = [
     c_int, c_double, c_int,
     POINTER(c_double), POINTER(c_double), POINTER(c_double), POINTER(c_double),
@@ -49,15 +54,18 @@ _lib.pg_set_background.argtypes = [
 ]
 _lib.pg_set_background.restype  = None
 
+# Analyze
 _lib.pg_analyze_current.argtypes = [POINTER(c_int)]
 _lib.pg_analyze_current.restype  = None
 
+# Modes meta
 _lib.pg_modes_count.argtypes = [POINTER(c_int)]
 _lib.pg_modes_count.restype  = None
 
 _lib.pg_mode_shape.argtypes = [c_int, POINTER(c_int)]
 _lib.pg_mode_shape.restype  = None
 
+# Mode copy:
 # pg_mode_copy(k, r, nr, np_over_r, dp, dQ, dpsi, K_cap, Psi_cap, freq, nt, time, ierr)
 _lib.pg_mode_copy.argtypes = [
     c_int,
@@ -67,9 +75,11 @@ _lib.pg_mode_copy.argtypes = [
 ]
 _lib.pg_mode_copy.restype  = None
 
+# Background result shape
 _lib.pg_background_shape.argtypes = [POINTER(c_int)]
 _lib.pg_background_shape.restype  = None
 
+# Background copy:
 # pg_background_copy(r, rho, eps, p, cs2, phi, alpha, h, q, e,
 #                    gamma1, ggrav, n2, lamb2, Bstar, Qcap, inv_cs2, mass_v,
 #                    nt, time, ierr)
@@ -84,44 +94,68 @@ _lib.pg_background_copy.argtypes = [
 _lib.pg_background_copy.restype  = None
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
+#                                  Utilities                                    #
+# ----------------------------------------------------------------------------- #
 
-def _as_f64_ptr(a: np.ndarray):
-    """Ensure float64, contiguous (any order), return pointer."""
+def _as_ptr_f64(a: np.ndarray):
+    """Return (array_cast, pointer) as float64 contiguous."""
     if not isinstance(a, np.ndarray):
         a = np.asarray(a, dtype=np.float64)
-    if a.dtype != np.float64:
-        a = a.astype(np.float64)
-    if not a.flags['C_CONTIGUOUS'] and not a.flags['F_CONTIGUOUS']:
+    elif a.dtype != np.float64:
+        a = a.astype(np.float64, copy=False)
+    if not (a.flags["C_CONTIGUOUS"] or a.flags["F_CONTIGUOUS"]):
         a = np.ascontiguousarray(a)
     return a, a.ctypes.data_as(POINTER(c_double))
 
 
+def _require_keys(d: dict, keys: tuple[str, ...]) -> None:
+    missing = [k for k in keys if k not in d]
+    if missing:
+        raise KeyError(f"background missing keys: {missing}")
+
+
+def _assert_monotonic_increasing(r: np.ndarray) -> None:
+    if r.size >= 2 and not np.all(np.diff(r) > 0):
+        raise ValueError("background r must be strictly increasing (ascending).")
+
+
+def _assert_finite(*arrays: np.ndarray) -> None:
+    for a in arrays:
+        if not np.all(np.isfinite(a)):
+            raise ValueError("background contains NaN/Inf values.")
+
+
+# ----------------------------------------------------------------------------- #
+#                                 Main session                                  #
+# ----------------------------------------------------------------------------- #
+
 class PyGreatSession:
     """
-    Thin Python wrapper around the Fortran shim.
+    Thin Python wrapper around the Fortran GREAT shim.
 
-    Usage:
+    Typical usage:
         sess = PyGreatSession()
         sess.load_parameters("parameters")
         sess.reset_capture()
-        sess.set_background(nt, time, bg_dict)
+        sess.set_background(nt, time, bg_dict)  # bg_dict uses keys: r, rho, eps, p, cs2|c_sound_squared, phi, alpha, v_1
         sess.analyze()
         nm = sess.get_modes_count()
-        ...
+        mode1 = sess.copy_mode(1)
+        bgout = sess.copy_background()
     """
 
     def __init__(self) -> None:
         self._lib = _lib
         self._last_iR: int | None = None
-        self._prev_modes_count: int = 0  # for delta-mode logic if needed
+        self._prev_modes_count: int = 0
 
     # -------- Parameters --------
     def load_parameters(self, parfile: str) -> None:
         ierr = c_int(0)
         self._lib.pg_load_parameters(parfile.encode("utf-8"), byref(ierr))
         if ierr.value != 0:
-            raise RuntimeError(f"Read_parameters() failed with ierr={ierr.value}")
+            raise RuntimeError(_err_msg("pg_load_parameters", ierr.value))
 
     # -------- Capture buffer --------
     def reset_capture(self) -> None:
@@ -131,18 +165,15 @@ class PyGreatSession:
     # -------- Background --------
     def set_background(self, nt: int, time: float, bg: dict) -> None:
         """
-        bg must contain: r, rho, eps, p, cs2 (or c_sound_squared), phi, alpha, v_1
-        All arrays length m.
+        bg must contain (1D float64 arrays of equal length m):
+            r, rho, eps, p, cs2 (or c_sound_squared), phi, alpha, v_1
         """
-        # Accept legacy/alternative names
+        # Accept legacy name for cs^2
         if "cs2" not in bg and "c_sound_squared" in bg:
             bg = dict(bg)  # avoid mutating caller
             bg["cs2"] = bg["c_sound_squared"]
 
-        required = ["r", "rho", "eps", "p", "cs2", "phi", "alpha", "v_1"]
-        missing = [k for k in required if k not in bg]
-        if missing:
-            raise KeyError(f"background missing keys: {missing}")
+        _require_keys(bg, ("r", "rho", "eps", "p", "cs2", "phi", "alpha", "v_1"))
 
         r   = np.asarray(bg["r"],   dtype=np.float64, order="C")
         rho = np.asarray(bg["rho"], dtype=np.float64, order="C")
@@ -154,32 +185,38 @@ class PyGreatSession:
         v1  = np.asarray(bg["v_1"], dtype=np.float64, order="C")
 
         m = int(r.shape[0])
-        if not all(arr.shape[0] == m for arr in (rho, eps, p, cs2, phi, alp, v1)):
-            raise ValueError("background arrays must have identical length")
+        if not all(arr.shape == (m,) for arr in (rho, eps, p, cs2, phi, alp, v1)):
+            raise ValueError("background arrays must be 1D and have identical length")
 
-        def _ptr(a):
-            if not (a.flags['C_CONTIGUOUS'] or a.flags['F_CONTIGUOUS']):
-                a = np.ascontiguousarray(a)
-            return a.ctypes.data_as(POINTER(c_double))
+        _assert_monotonic_increasing(r)
+        _assert_finite(r, rho, eps, p, cs2, phi, alp, v1)
+
+        # Pointers
+        pr   = r.ctypes.data_as(POINTER(c_double))
+        prho = rho.ctypes.data_as(POINTER(c_double))
+        peps = eps.ctypes.data_as(POINTER(c_double))
+        pp   = p.ctypes.data_as(POINTER(c_double))
+        pcs2 = cs2.ctypes.data_as(POINTER(c_double))
+        pphi = phi.ctypes.data_as(POINTER(c_double))
+        palp = alp.ctypes.data_as(POINTER(c_double))
+        pv1  = v1.ctypes.data_as(POINTER(c_double))
 
         ierr = c_int(0)
         self._lib.pg_set_background(
             c_int(int(nt)), c_double(float(time)), c_int(m),
-            _ptr(r), _ptr(rho), _ptr(eps), _ptr(p),
-            _ptr(cs2), _ptr(phi), _ptr(alp), _ptr(v1),
+            pr, prho, peps, pp, pcs2, pphi, palp, pv1,
             byref(ierr),
         )
         if ierr.value != 0:
-            raise RuntimeError(f"pg_set_background failed with ierr={ierr.value}")
-        self._last_iR = None  # unknown until analyze()
-
+            raise RuntimeError(_err_msg("pg_set_background", ierr.value))
+        self._last_iR = None  # till analyze()
 
     # -------- Run analysis --------
     def analyze(self) -> None:
         ierr = c_int(0)
         self._lib.pg_analyze_current(byref(ierr))
         if ierr.value != 0:
-            raise RuntimeError(f"pg_analyze_current failed with ierr={ierr.value}")
+            raise RuntimeError(_err_msg("pg_analyze_current", ierr.value))
 
     # -------- Modes API --------
     def get_modes_count(self) -> int:
@@ -198,14 +235,14 @@ class PyGreatSession:
             raise IndexError("invalid mode index or empty spectrum")
 
         # allocate numpy arrays
-        r        = np.empty(iR, dtype=np.float64)
-        nr       = np.empty(iR, dtype=np.float64)
-        np_over_r= np.empty(iR, dtype=np.float64)
-        dp       = np.empty(iR, dtype=np.float64)
-        dQ       = np.empty(iR, dtype=np.float64)
-        dpsi     = np.empty(iR, dtype=np.float64)
-        K        = np.empty(iR, dtype=np.float64)
-        Psi      = np.empty(iR, dtype=np.float64)
+        r         = np.empty(iR, dtype=np.float64)
+        nr        = np.empty(iR, dtype=np.float64)
+        np_over_r = np.empty(iR, dtype=np.float64)
+        dp        = np.empty(iR, dtype=np.float64)
+        dQ        = np.empty(iR, dtype=np.float64)
+        dpsi      = np.empty(iR, dtype=np.float64)
+        K         = np.empty(iR, dtype=np.float64)
+        Psi       = np.empty(iR, dtype=np.float64)
 
         pr   = r.ctypes.data_as(POINTER(c_double))
         pnr  = nr.ctypes.data_as(POINTER(c_double))
@@ -227,16 +264,21 @@ class PyGreatSession:
             byref(freq), byref(nt), byref(time), byref(ierr),
         )
         if ierr.value != 0:
-            raise RuntimeError(f"pg_mode_copy failed with ierr={ierr.value}")
+            raise RuntimeError(_err_msg("pg_mode_copy", ierr.value))
 
         return {
             "iR": iR,
             "freq": float(freq.value),
             "nt": int(nt.value),
             "time": float(time.value),
-            "r": r, "eta_r": nr, "eta_perp_over_r": np_over_r,
-            "delta_P": dp, "delta_Q": dQ, "delta_psi": dpsi,
-            "K": K, "Psi": Psi,
+            "r": r,
+            "eta_r": nr,
+            "eta_perp_over_r": np_over_r,
+            "delta_P": dp,
+            "delta_Q": dQ,
+            "delta_psi": dpsi,
+            "K": K,
+            "Psi": Psi,
         }
 
     # -------- Background API --------
@@ -250,43 +292,45 @@ class PyGreatSession:
         if iR <= 0:
             raise RuntimeError("background not yet analyzed or empty")
 
-        def arr():
+        def arr_ptr():
             a = np.empty(iR, dtype=np.float64)
             return a, a.ctypes.data_as(POINTER(c_double))
 
-        r,pr         = arr()
-        rho,prho     = arr()
-        eps,peps     = arr()
-        p,pp         = arr()
-        cs2,pcs2     = arr()
-        phi,pphi     = arr()
-        alpha,palpha = arr()
-        h,ph         = arr()
-        q,pq         = arr()
-        e,pe         = arr()
-        gamma1,pg1   = arr()
-        ggrav,pg     = arr()
-        n2,pn2       = arr()
-        lamb2,pl2    = arr()
-        Bstar,pb     = arr()
-        Qcap,pQ      = arr()
-        inv_cs2,pinv = arr()
-        mass_v,pmass = arr()
+        r,         pr   = arr_ptr()
+        rho,       prho = arr_ptr()
+        eps,       peps = arr_ptr()
+        p,         pp   = arr_ptr()
+        cs2,       pcs2 = arr_ptr()
+        phi,       pphi = arr_ptr()
+        alpha,     palp = arr_ptr()
+        h,         ph   = arr_ptr()
+        q,         pq   = arr_ptr()
+        e,         pe   = arr_ptr()
+        gamma1,    pg1  = arr_ptr()
+        ggrav,     pg   = arr_ptr()
+        n2,        pn2  = arr_ptr()
+        lamb2,     pl2  = arr_ptr()
+        Bstar,     pb   = arr_ptr()
+        Qcap,      pQ   = arr_ptr()
+        inv_cs2,   pinv = arr_ptr()
+        mass_v,    pmass= arr_ptr()
 
         nt   = c_int(0)
         time = c_double(0.0)
         ierr = c_int(0)
 
         self._lib.pg_background_copy(
-            pr, prho, peps, pp, pcs2, pphi, palpha,
+            pr, prho, peps, pp, pcs2, pphi, palp,
             ph, pq, pe, pg1, pg, pn2, pl2, pb, pQ, pinv, pmass,
             byref(nt), byref(time), byref(ierr),
         )
         if ierr.value != 0:
-            raise RuntimeError(f"pg_background_copy failed with ierr={ierr.value}")
+            raise RuntimeError(_err_msg("pg_background_copy", ierr.value))
 
         return {
-            "iR": iR, "nt": int(nt.value), "time": float(time.value),
+            "iR": iR,
+            "nt": int(nt.value),
+            "time": float(time.value),
             "r": r, "rho": rho, "eps": eps, "p": p, "cs2": cs2,
             "phi": phi, "alpha": alpha, "h": h, "q": q, "e": e,
             "gamma1": gamma1, "ggrav": ggrav, "n2": n2, "lamb2": lamb2,
